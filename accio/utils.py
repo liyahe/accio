@@ -629,6 +629,7 @@ def cosine_similarity(x, y):
     return x.mm(y.t()) / (x.norm(dim=1).unsqueeze(1) * y.norm(dim=1).unsqueeze(0))
 
 
+@auto_data_type_convert(target_type=torch.Tensor)
 def kl_divergence(p, q):
     # p: (N1, c), q: (N2, c), return: (N1, N2)
     p = p.view(-1, p.shape[-1])
