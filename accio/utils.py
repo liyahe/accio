@@ -156,6 +156,9 @@ def config_logging(file_name: str, console_level: int = logging.DEBUG, file_leve
         '%(message)s',  # [%(levelname)s]:
     ))
     console_handler.setLevel(console_level)
+    
+    if output_to_file:
+        os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
     logging.basicConfig(
         level=min(console_level, file_level),
