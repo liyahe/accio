@@ -53,7 +53,7 @@ def indirect_calls(
         raise NotImplementedError
     if dataloader is None:
         assert dataset is not None
-        dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=kwargs.get("batch_size", 8))
+        dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=kwargs.get("batch_size", 8), num_workers=kwargs.get("num_workers", 0))
     if func_kwargs is None:
         func_kwargs = {}
     outputs, dict_outputs = [], {}
