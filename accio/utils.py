@@ -1,4 +1,3 @@
-
 import datetime
 import logging
 import os
@@ -8,6 +7,7 @@ import sys
 import time
 from typing import Union, Dict
 import copy
+
 # can you see this?
 import numpy as np
 import torch
@@ -19,13 +19,51 @@ from sklearn.manifold import TSNE, Isomap, MDS, LocallyLinearEmbedding, Spectral
 
 from .pca_torch import PCA_Torch
 
+import copy
+from typing import Dict, Union
+import torch
+from torch.utils.data import DataLoader, SequentialSampler, Sampler
+import logging
+from tqdm import tqdm
+
 # logger = logging.getLogger(__name__)
-logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
 def add_one(x):
     return x + 1
 
+
+def timer(func):
+    def func_wrapper(*args, **kwargs):
+        from time import time
+
+        time_start = time()
+        result = func(*args, **kwargs)
+        time_end = time()
+        time_spend = time_end - time_start
+        logging.info("%s cost time: %.3f s" % (func.__name__, time_spend))
+        return result
+
+    return func_wrapper
+
+
+def get_inputs_process_func(args):
+    def inner_func(batch):
+        batch = tuple(t.to(args.device) for t in batch)
+        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+        if args.model_type != "distilbert":
+            inputs["token_type_ids"] = (
+                batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
+            )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
+        if len(batch) == 5:
+            if args.local_params.get("InfoRetention", False):
+                inputs["new_input_ids"] = batch[4]
+            else:
+                inputs["inputs_embeds_noise"] = batch[4]
+        return inputs
+
+    return inner_func
 
 
 def indirect_calls(
@@ -43,7 +81,12 @@ def indirect_calls(
         raise NotImplementedError
     if dataloader is None:
         assert dataset is not None
-        dataloader = DataLoader(dataset, sampler=SequentialSampler(dataset), batch_size=kwargs.get('batch_size', 8))
+        dataloader = DataLoader(
+            dataset,
+            sampler=SequentialSampler(dataset),
+            batch_size=kwargs.get("batch_size", 8),
+            num_workers=kwargs.get("num_workers", 0),
+        )
     if func_kwargs is None:
         func_kwargs = {}
     outputs, dict_outputs = [], {}
@@ -52,7 +95,7 @@ def indirect_calls(
     original_mode = model.training
     model.train(training)
     with torch.no_grad():
-        for step, batch_inputs in enumerate(dataloader):
+        for step, batch_inputs in enumerate(tqdm(dataloader)):
             # batch_x = {k: t.to(self.device) for k, t in batch_inputs.items() if k != 'y'}
             if prepare_inputs is not None:
                 batch_inputs = prepare_inputs(batch_inputs)
@@ -74,10 +117,22 @@ def indirect_calls(
     return outputs
 
 
+def whiting(vecs: torch.Tensor, eps=1e-8):
+    """进行白化处理
+    x.shape = [num_samples, embedding_size]，
+    最后的变换: y = (x - mu).dot( W^T )
+    """
+    mu = vecs.mean(dim=0, keepdims=True)  # [1, embedding_size]
+    cov = torch.cov(vecs.T)  # [embedding_size, embedding_size]
+    u, s, vh = torch.linalg.svd(cov)
+    W = torch.mm(u, torch.diag(1.0 / (torch.sqrt(s) + eps)))  # [embedding_size, embedding_size]
+    return (vecs - mu).mm(W)  # [num_samples, embedding_size]
+
+
 def parse_arg_from_str(s: str, key: str, type_=float):
     """a simple func to parse arg from str, only support specific format, e.g. local_acc_knn30_KR0.5"""
     if key in s:
-        res = s.split(key)[-1].split('_')[0]
+        res = s.split(key)[-1].split("_")[0]
         try:
             res = float(res)  # when res is a number
             return type_(res)
@@ -86,7 +141,7 @@ def parse_arg_from_str(s: str, key: str, type_=float):
     return None
 
 
-def kernel_regression(x, x_support, y_support, h=1.0, kernel='gaussian'):
+def kernel_regression(x, x_support, y_support, h=1.0, kernel="gaussian"):
     """
 
     Args:
@@ -100,19 +155,22 @@ def kernel_regression(x, x_support, y_support, h=1.0, kernel='gaussian'):
 
     """
     eps = 1e-7
-    if kernel == 'gaussian':
+    if kernel == "gaussian":
         # if h == 'adaptive':
         #     h = (normed_euclidean_distance_func(x_support, x_support) ** 2).mean().sqrt() / 3.0 + eps  # (1, ), std
-        K = lambda distance_mat: torch.exp(-distance_mat ** 2 / (2 * (h ** 2)))
+        K = lambda distance_mat: torch.exp(-(distance_mat**2) / (2 * (h**2)))
     else:
-        raise ValueError(f'Unknown kernel {kernel}')
+        raise ValueError(f"Unknown kernel {kernel}")
     dist_mat = normed_euclidean_distance(x, x_support)  # (n, m)
     kernel_score = K(dist_mat)  # (n, m)
     kernel_score = kernel_score / (kernel_score.sum(dim=-1, keepdim=True) + eps)  # (n, m)
     not_valid = (kernel_score.sum(-1) - 1.0).abs() > 1e-3  # (n, )
     if not_valid.any():  # kernel score is too small and sum to 0
-        logging.info(color(f'warning: kernel score is too small and sum to 0, '
-                          f'{not_valid.sum()} / {not_valid.shape[0]}', 'red'))
+        logging.info(
+            color(
+                f"warning: kernel score is too small and sum to 0, " f"{not_valid.sum()} / {not_valid.shape[0]}", "red"
+            )
+        )
         # this means each support point is too far from x, so we just use the nearest support point
         nearest_support_idx = torch.argmin(dist_mat, dim=1)  # (n, )
         for i in torch.arange(len(kernel_score), device=kernel_score.device)[not_valid]:
@@ -122,7 +180,7 @@ def kernel_regression(x, x_support, y_support, h=1.0, kernel='gaussian'):
     return torch.matmul(kernel_score, y_support)  # (n, ) or (n, any_dim)
 
 
-def get_result_dir(experiment_cfg: str, root_result_dir: str = 'result'):
+def get_result_dir(experiment_cfg: str, root_result_dir: str = "result"):
     """
     Get the result directory, create it if not exist. Make sure the result directory is unique and will not
     cover the previous result.
@@ -133,30 +191,34 @@ def get_result_dir(experiment_cfg: str, root_result_dir: str = 'result'):
     Returns:
 
     """
-    now_time = datetime.datetime.now().strftime('%Y-%m-%d')  # avoid the result dir name conflict
-    if not os.path.exists(f'{root_result_dir}/{now_time}/{experiment_cfg}'):
-        return f'{root_result_dir}/{now_time}/{experiment_cfg}'
+    now_time = datetime.datetime.now().strftime("%Y-%m-%d")  # avoid the result dir name conflict
+    if not os.path.exists(f"{root_result_dir}/{now_time}/{experiment_cfg}"):
+        return f"{root_result_dir}/{now_time}/{experiment_cfg}"
     for i in range(1, 101):
-        if not os.path.exists(f'{root_result_dir}/{now_time}#{i}/{experiment_cfg}'):
-            return f'{root_result_dir}/{now_time}#{i}/{experiment_cfg}'
-    raise ValueError(f'Failed to create result directory for {experiment_cfg}')  # 100个结果目录都已经存在，说明实验太多了
+        if not os.path.exists(f"{root_result_dir}/{now_time}#{i}/{experiment_cfg}"):
+            return f"{root_result_dir}/{now_time}#{i}/{experiment_cfg}"
+    raise ValueError(f"Failed to create result directory for {experiment_cfg}")  # 100个结果目录都已经存在，说明实验太多了
 
 
-def config_logging(file_name: str, console_level: int = logging.DEBUG, file_level: int = logging.DEBUG,
-                   output_to_file=True):  # 配置日志输出
-    file_handler = logging.FileHandler(file_name, mode='a', encoding="utf8")
-    file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(module)s.%(lineno)d:\t%(message)s',
-        datefmt="%Y/%m/%d %H:%M:%S"
-    ))
+def config_logging(
+    file_name: str, console_level: int = logging.DEBUG, file_level: int = logging.DEBUG, output_to_file=True
+):  # 配置日志输出
+    file_handler = logging.FileHandler(file_name, mode="a", encoding="utf8")
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(module)s.%(lineno)d:\t%(message)s", datefmt="%Y/%m/%d %H:%M:%S"
+        )
+    )
     file_handler.setLevel(file_level)
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(logging.Formatter(
-        '%(message)s',  # [%(levelname)s]:
-    ))
+    console_handler.setFormatter(
+        logging.Formatter(
+            "%(message)s",  # [%(levelname)s]:
+        )
+    )
     console_handler.setLevel(console_level)
-    
+
     if output_to_file:
         os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
@@ -179,24 +241,26 @@ def cache_result(cache_path, overwrite=False, logger=None):
     def wrapper_generator(func):
         def wrapper(*args, **kwargs):
             success = False
-            info, result = '', None
+            info, result = "", None
             if os.path.exists(cache_path) and not overwrite:
                 start = time.time()
                 try:
-                    result = pickle.load(open(cache_path, 'rb'))
-                    info = color(f"Load result of {func.__name__} from {cache_path} [took {time.time() - start:.2f} s]",
-                                 'blue')
+                    result = pickle.load(open(cache_path, "rb"))
+                    info = color(
+                        f"Load result of {func.__name__} from {cache_path} [took {time.time() - start:.2f} s]", "blue"
+                    )
                     success = True
                 except Exception as e:
-                    info = color(f'Failed to load result of {func.__name__} from {cache_path}, Exception: {e}', 'red')
+                    info = color(f"Failed to load result of {func.__name__} from {cache_path}, Exception: {e}", "red")
                     logging.info(info)
             if not success:
                 start = time.time()
                 result = func(*args, **kwargs)
-                pickle.dump(result, open(cache_path, 'wb'))
+                pickle.dump(result, open(cache_path, "wb"))
                 info = color(
-                    f'Compute and save result of {func.__name__} at {cache_path}, [took {time.time() - start:.2f} s]',
-                    'blue')
+                    f"Compute and save result of {func.__name__} at {cache_path}, [took {time.time() - start:.2f} s]",
+                    "blue",
+                )
             logging.info(info)
             return result
 
@@ -217,8 +281,7 @@ def allow_exception(logger=None):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                info = color(f'Failed to execute function {func.__name__}: raise Exception \'{e}\' and ignore it.',
-                             'red')
+                info = color(f"Failed to execute function {func.__name__}: raise Exception '{e}' and ignore it.", "red")
                 logging.warning(info)
 
         return wrapper
@@ -255,7 +318,7 @@ def auto_data_type_convert(target_type):
                     kwargs[k] = convert_type(v, target_type)
             output = func(*args, **kwargs)
             if device is None:
-                device = torch.device('cpu')  # default device
+                device = torch.device("cpu")  # default device
             if isinstance(output, tuple):
                 return tuple(convert_type(o, dt, device, strict=False) for o in output)
             return convert_type(output, dt, device, strict=False)
@@ -265,7 +328,7 @@ def auto_data_type_convert(target_type):
     return wrapper_generator
 
 
-def convert_type(data, dt, device=torch.device('cpu'), strict=True):  # 转换数据类型，以适应不同的输入输出
+def convert_type(data, dt, device=torch.device("cpu"), strict=True):  # 转换数据类型，以适应不同的输入输出
     """
     Convert the data type to the target type.
     Args:
@@ -280,8 +343,8 @@ def convert_type(data, dt, device=torch.device('cpu'), strict=True):  # 转换�
     if not strict:
         if dt not in (torch.Tensor, np.ndarray, list) or not isinstance(data, (torch.Tensor, np.ndarray, list)):
             return data  # 如果不严格检查，不支持的数据类型直接返回
-    assert dt in (torch.Tensor, np.ndarray, list), f'unsupported data type: {dt}'
-    assert isinstance(data, (torch.Tensor, np.ndarray, list)), f'unsupported data type: {type(data)}'
+    assert dt in (torch.Tensor, np.ndarray, list), f"unsupported data type: {dt}"
+    assert isinstance(data, (torch.Tensor, np.ndarray, list)), f"unsupported data type: {type(data)}"
     if dt == np.ndarray:
         if isinstance(data, torch.Tensor):
             data = data.detach().cpu().numpy()
@@ -302,21 +365,21 @@ def convert_type(data, dt, device=torch.device('cpu'), strict=True):  # 转换�
     return data
 
 
-def knn_graph(embeddings, k, metric='euclidean', include_self=True) -> torch.LongTensor:
+def knn_graph(embeddings, k, metric="euclidean", include_self=True) -> torch.LongTensor:
     """计算knn图, 输入（num_examples, dim）的embeddings, 输出（num_examples, k）的knn indices"""
     device = embeddings.device
     k = k + 1 if not include_self else k
     num_examples = len(embeddings)
     if k > num_examples:
-        raise ValueError(f'k({k}) must be equal or less than num_examples({num_examples})')
-    if metric == 'cosine':
+        raise ValueError(f"k({k}) must be equal or less than num_examples({num_examples})")
+    if metric == "cosine":
         distance_matrix = 1.0 - cosine_similarity(embeddings, embeddings)
-    elif metric == 'dot':
+    elif metric == "dot":
         distance_matrix = -torch.mm(embeddings, embeddings.t())
-    elif metric == 'euclidean':
+    elif metric == "euclidean":
         distance_matrix = torch.cdist(embeddings, embeddings, p=2)
     else:
-        raise ValueError(f'unsupported metric: {metric}')
+        raise ValueError(f"unsupported metric: {metric}")
     _, indices = topk_with_batch(distance_matrix, k=k, batch_size=10000, dim=-1, largest=False)
     # embeddings = embeddings.cpu().numpy()
     # nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto', metric=metric).fit(embeddings)
@@ -345,28 +408,29 @@ def log_sum_exp(x, axis=None):
 
 def get_nonlinearity(act: str) -> torch.nn.Module:
     """get non-linearity function"""
-    if act in ['relu', 'ReLU']:
+    if act in ["relu", "ReLU"]:
         return torch.nn.ReLU()
-    elif act == 'leaky_relu':
+    elif act == "leaky_relu":
         return torch.nn.LeakyReLU()
-    elif act == 'tanh':
+    elif act == "tanh":
         return torch.nn.Tanh()
-    elif act == 'sigmoid':
+    elif act == "sigmoid":
         return torch.nn.Sigmoid()
-    elif act == 'elu':
+    elif act == "elu":
         return torch.nn.ELU()
-    elif act == 'selu':
+    elif act == "selu":
         return torch.nn.SELU()
-    elif act == 'gelu':
+    elif act == "gelu":
         return torch.nn.GELU()
-    elif act == 'none':
+    elif act == "none":
         return torch.nn.Identity()
     else:
-        raise ValueError(f'unsupported activation function: {act}')
+        raise ValueError(f"unsupported activation function: {act}")
 
 
-def get_cls_boundary_projection(cls_embeddings, cls_weight, cls_bias=None, normalize_boundary=True,
-                                return_boundary=False):
+def get_cls_boundary_projection(
+    cls_embeddings, cls_weight, cls_bias=None, normalize_boundary=True, return_boundary=False
+):
     """计算分类边界法向量上的投影"""
     device = cls_embeddings.device
     if cls_bias is not None:
@@ -420,26 +484,28 @@ def set_random_seed(seed):
 #     return logger
 
 
-def k_means_clustering(embedding, num_clusters, device=torch.device('cpu')):
+def k_means_clustering(embedding, num_clusters, device=torch.device("cpu")):
     kmeans = KMeans(n_clusters=num_clusters, random_state=0, n_init=10).fit(embedding.cpu().numpy())
     return torch.from_numpy(kmeans.labels_).to(device), torch.from_numpy(kmeans.cluster_centers_).to(device)
 
 
 @auto_data_type_convert(target_type=np.ndarray)  # the function take ndarray as input
-def clustering(embeddings, num_clusters=2, method='kmeans', eps=0.5, min_samples=5,
-               affinity='euclidean', linkage='ward', n_init=10):
-    print(f'clustering {embeddings.shape} shape data to {num_clusters} clusters with {method} method...')
+def clustering(
+    embeddings, num_clusters=2, method="kmeans", eps=0.5, min_samples=5, affinity="euclidean", linkage="ward", n_init=10
+):
+    print(f"clustering {embeddings.shape} shape data to {num_clusters} clusters with {method} method...")
     # device = embeddings.device if isinstance(embeddings, torch.Tensor) else torch.device('cpu')
     # dt = type(embeddings)
     # embeddings = convert_type(embeddings, np.ndarray)
-    if method == 'kmeans':
+    if method == "kmeans":
         kmeans = KMeans(n_clusters=num_clusters, random_state=0, n_init=n_init).fit(embeddings)
         return kmeans.labels_, kmeans.cluster_centers_
-    elif method == 'agglomerative':
+    elif method == "agglomerative":
         agglomerative = AgglomerativeClustering(n_clusters=num_clusters, affinity=affinity, linkage=linkage).fit(
-            embeddings)
+            embeddings
+        )
         return agglomerative.labels_, None
-    elif method == 'dbscan':
+    elif method == "dbscan":
         dbscan = DBSCAN(eps=eps, min_samples=min_samples).fit(embeddings)
         return dbscan.labels_, None
     else:
@@ -449,7 +515,7 @@ def clustering(embeddings, num_clusters=2, method='kmeans', eps=0.5, min_samples
 def k_means_plus_plus(embeddings, num_clusters):
     num_u = len(embeddings)
     if num_u < num_clusters:
-        raise ValueError(f'num_clusters ({num_clusters}) should be less than num_embeddings ({num_u})')
+        raise ValueError(f"num_clusters ({num_clusters}) should be less than num_embeddings ({num_u})")
     cluster_centers = []
     cluster_idx = []
     while len(cluster_idx) < num_clusters:
@@ -460,7 +526,7 @@ def k_means_plus_plus(embeddings, num_clusters):
         else:
             dist = torch.cdist(embeddings, torch.stack(cluster_centers, dim=0))
             dist = torch.min(dist, dim=1)[0]
-            dist = dist ** 2
+            dist = dist**2
             dist = dist / dist.sum()
             idx = torch.multinomial(dist, 1, replacement=False)[0].item()
             del dist
@@ -469,15 +535,18 @@ def k_means_plus_plus(embeddings, num_clusters):
         cluster_idx = list(set(cluster_idx))
     cluster_idx = list(set(cluster_idx))
     if not len(cluster_idx) == num_clusters:
-        raise ValueError('k-means++ error: cluster center idx len({}) mismatch with num_cluster({})'.format(
-            len(cluster_idx), num_clusters))
+        raise ValueError(
+            "k-means++ error: cluster center idx len({}) mismatch with num_cluster({})".format(
+                len(cluster_idx), num_clusters
+            )
+        )
     return torch.tensor(cluster_idx, device=embeddings.device)
 
 
 def k_center_greedy(embeddings, num_clusters):
     cluster_centers = []
     cluster_idx = []
-    while (len(set(cluster_idx)) < num_clusters):
+    while len(set(cluster_idx)) < num_clusters:
         if len(cluster_idx) == 0:
             idx = torch.multinomial(torch.ones(len(embeddings)), 1, replacement=False)[0].item()
             cluster_centers.append(embeddings[idx])
@@ -514,20 +583,20 @@ def pca(x, n_components, return_pca=False, torch_version=False):
 
 
 @auto_data_type_convert(target_type=np.ndarray)  # the function take ndarray as input
-def manifold_map(x, algorithm='tsne', n_components=2):
-    print('{} mapping from ({},{}) to ({},{})...'.format(algorithm, x.shape[0], x.shape[1], x.shape[0], n_components))
-    if algorithm == 'tsne':
+def manifold_map(x, algorithm="tsne", n_components=2):
+    print("{} mapping from ({},{}) to ({},{})...".format(algorithm, x.shape[0], x.shape[1], x.shape[0], n_components))
+    if algorithm == "tsne":
         mani_map = TSNE(n_components=n_components)
-    elif algorithm == 'isomap':
+    elif algorithm == "isomap":
         mani_map = Isomap(n_components=n_components)
-    elif algorithm == 'mds':
+    elif algorithm == "mds":
         mani_map = MDS(n_components=n_components)
-    elif algorithm == 'lle':
+    elif algorithm == "lle":
         mani_map = LocallyLinearEmbedding(n_components=n_components)
-    elif algorithm == 'spectralEmbedding':
+    elif algorithm == "spectralEmbedding":
         mani_map = SpectralEmbedding(n_components=n_components)
     else:
-        raise ValueError(f'unknown algorithm {algorithm}')
+        raise ValueError(f"unknown algorithm {algorithm}")
     # device = x.device if isinstance(x, torch.Tensor) else torch.device('cpu')
     # dt = type(x)
     # if isinstance(x, torch.Tensor):
@@ -557,8 +626,11 @@ def mahalanobis_distance(x, y, cov):
     # cov: Dim * Dim # 注意，这里的cov不是协方差矩阵
     # out:   N * M mahalanobis_distance Distance
     cov = cov + torch.eye(cov.shape[0], device=cov.device) * 1e-6
-    return ((x.mm(cov) * x).sum(-1, keepdims=True) + (y.mm(cov) * y).sum(-1, keepdims=True).T - 2 * x.mm(cov).mm(
-        y.t())).clamp(1e-6).sqrt()
+    return (
+        ((x.mm(cov) * x).sum(-1, keepdims=True) + (y.mm(cov) * y).sum(-1, keepdims=True).T - 2 * x.mm(cov).mm(y.t()))
+        .clamp(1e-6)
+        .sqrt()
+    )
 
 
 def jaccard_similarity(set_list):
@@ -567,7 +639,7 @@ def jaccard_similarity(set_list):
         return 1
     else:
         xs, xt = set(set_list[0]), set(set_list[0])
-        for (i, s) in enumerate(set_list):
+        for i, s in enumerate(set_list):
             if i != 0:
                 ss = set(s)
                 xs = xs & ss
@@ -584,17 +656,17 @@ def jaccard_similarity(set_list):
 # print(wd)
 
 
-def visualize(embeddings, labels, title='default', stress='zero'):
-    xx = manifold_map(embeddings, algorithm='tsne')
+def visualize(embeddings, labels, title="default", stress="zero"):
+    xx = manifold_map(embeddings, algorithm="tsne")
     # pickle.dump(xx, open('result_saved/mds-48-19-maskEmb.pkl', 'wb'))
     plt.clf()
-    if stress == 'zero':
+    if stress == "zero":
         plt.scatter(xx[:, 0], xx[:, 1], c=labels, cmap=plt.cm.Spectral, s=[20 if i == 0 else 0.5 for i in labels])
     else:
         plt.scatter(xx[:, 0], xx[:, 1], c=labels, cmap=plt.cm.Spectral, s=[10 if i != 0 else 0.5 for i in labels])
     plt.title(title)
-    print('title:', title)
-    plt.savefig(f'figs/visualize/{title}.png')
+    print("title:", title)
+    plt.savefig(f"figs/visualize/{title}.png")
     plt.show()
 
 
@@ -643,7 +715,7 @@ def kl_divergence(p, q):
 def get_one_hot(labels, num_classes=None):
     """Convert an iterable of indices to one-hot encoded labels."""
     if not isinstance(labels, torch.Tensor):
-        raise ValueError('labels must be a torch.Tensor')
+        raise ValueError("labels must be a torch.Tensor")
     if num_classes is None:
         num_classes = max(labels) + 1
     labels = labels.view(-1, 1)
@@ -652,42 +724,53 @@ def get_one_hot(labels, num_classes=None):
 
 def describe_model(model, input_size):
     from torchsummary import summary
+
     assert isinstance(model, torch.nn.Module)
-    print(f'------------------------------------{model.__class__.__name__}------------------------------------')
-    summary(model, input_size=input_size, device='cpu', batch_size=1)
+    print(f"------------------------------------{model.__class__.__name__}------------------------------------")
+    summary(model, input_size=input_size, device="cpu", batch_size=1)
 
 
 @auto_data_type_convert(target_type=torch.Tensor)  # convert input args into torch.Tensor
-def describe_statistic_info(data, name='data'):
+def describe_statistic_info(data, name="data"):
     # if not isinstance(data, torch.Tensor):
     #     if isinstance(data, np.ndarray):
     #         data = torch.from_numpy(data)
     #     else:
     #         raise ValueError('data must be torch.Tensor')
     data = data.float()
-    print(color('------------------------------------{}------------------------------------'.format(name)))
-    print(f'shape: {data.shape}')
+    print(color("------------------------------------{}------------------------------------".format(name)))
+    print(f"shape: {data.shape}")
     data = data.reshape(-1)
-    print(f'min: {torch.min(data).item() :.4f} | max: {torch.max(data).item() :.4f}')
+    print(f"min: {torch.min(data).item() :.4f} | max: {torch.max(data).item() :.4f}")
     print(
-        f'mean: {torch.mean(data).item() :.4f} | std: {torch.std(data).item() :.4f} | median: {torch.median(data).item() :.4f}')
+        f"mean: {torch.mean(data).item() :.4f} | std: {torch.std(data).item() :.4f} | median: {torch.median(data).item() :.4f}"
+    )
     distribution = torch.histc(data, bins=10)
     distribution = (distribution / torch.sum(distribution) * 100).tolist()
     key = torch.linspace(torch.min(data).item(), torch.max(data).item(), steps=11).tolist()
-    res = ''.join([f' {key[i] :.2f} : {distribution[i] :.2f}% |' for i in range(len(key) - 1)])
-    print(f'distribution: {res}')
-    print(color('------------------------------------------------------------------------' + '-' * len(name)))
+    res = "".join([f" {key[i] :.2f} : {distribution[i] :.2f}% |" for i in range(len(key) - 1)])
+    print(f"distribution: {res}")
+    print(color("------------------------------------------------------------------------" + "-" * len(name)))
     del data, distribution, key, res
 
 
-def color(text, color='purple'):  # or \033[32m
-    color2code = {'red': '\033[31m', 'green': '\033[32m', 'yellow': '\033[33m', 'blue': '\033[34m',
-                  'purple': '\033[35m', 'cyan': '\033[36m', 'white': '\033[37m', 'black': '\033[30m'}
+def color(text, color="purple"):  # or \033[32m
+    color2code = {
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "purple": "\033[35m",
+        "cyan": "\033[36m",
+        "white": "\033[37m",
+        "black": "\033[30m",
+    }
     return color2code[color] + text + "\033[0m"
 
 
-def plot_func_deprecated(x, y, xlabel='x', ylabel='y', title='default', label=None, type='line', c=None, save=False,
-                         y_std=None):
+def plot_func_deprecated(
+    x, y, xlabel="x", ylabel="y", title="default", label=None, type="line", c=None, save=False, y_std=None
+):
     # print(color('calling plot_func', 'blue') + f': algorithm={algorithm}, title={title}, save={save}')
     plt.clf()
     if isinstance(x, torch.Tensor):
@@ -699,29 +782,29 @@ def plot_func_deprecated(x, y, xlabel='x', ylabel='y', title='default', label=No
     if isinstance(y, list):
         y = np.array(y)
     assert isinstance(x, np.ndarray) and isinstance(y, np.ndarray)
-    assert x.shape == y.shape, f'x.shape={x.shape}, y.shape={y.shape}'
+    assert x.shape == y.shape, f"x.shape={x.shape}, y.shape={y.shape}"
     if len(x.shape) == 1:
         x = x.reshape(1, -1)
         y = y.reshape(1, -1)
         c = c.reshape(1, -1) if c is not None else None
         y_std = y_std.reshape(1, -1) if y_std is not None else None
-    if type == 'line':
+    if type == "line":
         for r in range(y.shape[0]):
             plt.plot(x[r], y[r], label=label[r] if label is not None else None)
             if y_std is not None:
                 plt.fill_between(x[r], y[r] - y_std[r], y[r] + y_std[r], alpha=0.2)
-    elif type == 'scatter':
+    elif type == "scatter":
         for r in range(y.shape[0]):
             plt.scatter(x[r], y[r], c=c[r] if c is not None else None, cmap=plt.cm.Spectral)
     else:
-        raise ValueError('algorithm must be line or scatter')
+        raise ValueError("algorithm must be line or scatter")
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.legend(loc=4)
     if save:
-        plt.savefig(f'figs/analyse/{title}.png')
-        print(color('Save as figs/analyse/{}.png'.format(title), 'blue'))
+        plt.savefig(f"figs/analyse/{title}.png")
+        print(color("Save as figs/analyse/{}.png".format(title), "blue"))
     else:
         plt.show()
 
@@ -737,62 +820,69 @@ def any_to_numpy(data):
         try:
             data = np.array(data)
         except Exception as _:
-            raise ValueError('unknown data algorithm', type(data))
+            raise ValueError("unknown data algorithm", type(data))
     return data
 
 
 # better version
-def plot_func(x: dict, y: dict = None, title=None, type='line', c=None, y_std=None, save=False):
+def plot_func(x: dict, y: dict = None, title=None, type="line", c=None, y_std=None, save=False):
     # print(color('calling plot_func', 'blue') + f': algorithm={algorithm}, title={title}, save={save}')
     assert isinstance(x, dict) and (y is None or isinstance(y, dict))
     plt.clf()
-    assert len(x.keys()) == 1, 'x只能有一个key'
+    assert len(x.keys()) == 1, "x只能有一个key"
     xlabel = list(x.keys())[0]  # 横轴的key
     x_ = any_to_numpy(x[xlabel])
 
-    if type == 'line':
-        assert y is not None and len(y.keys()) > 0, 'line时纵轴至少有一个key'
+    if type == "line":
+        assert y is not None and len(y.keys()) > 0, "line时纵轴至少有一个key"
         for ylable in y.keys():
             y_ = any_to_numpy(y[ylable])
             plt.plot(x_, y_, label=ylable)
             if y_std is not None and ylable in y_std.keys():
                 y_std_ = any_to_numpy(y_std[ylable])
                 plt.fill_between(x_, y_ - y_std_, y_ + y_std_, alpha=0.2)
-    elif type == 'scatter':
+    elif type == "scatter":
         if y is not None:
-            assert len(y.keys()) == 1, 'scatter时纵轴至多有一个key'
+            assert len(y.keys()) == 1, "scatter时纵轴至多有一个key"
             y_ = any_to_numpy(y[list(y.keys())[0]])
             x_ = np.stack([x_, y_], axis=-1)
-        assert x_.shape[-1] == 2, 'scatter只支持二维散点图，x的最后一维必须为2'
+        assert x_.shape[-1] == 2, "scatter只支持二维散点图，x的最后一维必须为2"
         c_ = any_to_numpy(c) if c is not None else None  # 不同颜色的点
-        psc = plt.scatter(x_[:, 0], x_[:, 1], c=c_ if c_ is not None else None, cmap=plt.cm.Spectral, s=0.5, )
+        psc = plt.scatter(
+            x_[:, 0],
+            x_[:, 1],
+            c=c_ if c_ is not None else None,
+            cmap=plt.cm.Spectral,
+            s=0.5,
+        )
     else:
-        raise ValueError('algorithm must be line or scatter')
+        raise ValueError("algorithm must be line or scatter")
     if title is None:
-        title = f'{xlabel} vs {list(y.keys())[0]}' if y is not None else f'{xlabel}'
+        title = f"{xlabel} vs {list(y.keys())[0]}" if y is not None else f"{xlabel}"
     plt.title(title)
     plt.xlabel(xlabel)
-    if type == 'scatter':
+    if type == "scatter":
         if c is not None:
             plt.legend(*psc.legend_elements(), loc=4)
     else:
         plt.legend(loc=4)
     if save:
-        os.makedirs('figs/analyse', exist_ok=True)
-        plt.savefig(f'figs/analyse/{title}.png')
-        print(color('Save as figs/analyse/{}.png'.format(title), 'blue'))
+        os.makedirs("figs/analyse", exist_ok=True)
+        plt.savefig(f"figs/analyse/{title}.png")
+        print(color("Save as figs/analyse/{}.png".format(title), "blue"))
     plt.show()
 
 
-def power_law_distribution(size, p=2, lower=0., upper=1.):  # 与np.random.power(p)等价，但是可以指定范围，power默认[0,1]
+def power_law_distribution(size, p=2, lower=0.0, upper=1.0):  # 与np.random.power(p)等价，但是可以指定范围，power默认[0,1]
     # 生成power law分布的随机数，p越大，分布越集中向 upper
     # p(x) = x^p / Z, 其中 Z = int_{l}^{u} x^p dx = (u ^ (1 + p) - l ^ (1 + p)) / (1 + p)
     # 则 pdf(x) =  (x^(p+1) - l^(p+1)) / (Z * (1 + p))
     # 则 pdf-1(x) = (x * Z * (p + 1) + l^(p + 1)) ^ (1 / (1 + p))
     # = (x * (u ^ (p + 1) - l ^ (p + 1)) + l ^ (p + 1)) ^ (1 / (1 + p))
-    assert p > 0 and upper > lower >= 0, f'p={p}, upper={upper}, lower={lower}'
+    assert p > 0 and upper > lower >= 0, f"p={p}, upper={upper}, lower={lower}"
     r = np.random.random(size=size)
     return ((upper ** (p + 1) - lower ** (p + 1)) * r + lower ** (p + 1)) ** (1.0 / (p + 1))
+
 
 # describe_statistic_info(torch.from_numpy(power_law_distribution(100000, p=4, lower=0., upper=1.)))
 # describe_statistic_info(torch.from_numpy(np.random.power(4, 100000)))

@@ -1,8 +1,7 @@
-from .utils import add_one
-from .torch_tools import (
+from .utils import (
     indirect_calls,
+    add_one,
 )
-
 
 __all__ = (
     'add_one',
