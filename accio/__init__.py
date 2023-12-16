@@ -1,5 +1,5 @@
 from .utils import add_one
-from .torch_tools.tools import (
+from .torch_tools import (
     indirect_calls,
 )
 
